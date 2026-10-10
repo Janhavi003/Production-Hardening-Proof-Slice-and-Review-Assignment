@@ -1,34 +1,35 @@
 'use strict';
 
-// Your task: implement a circuit breaker around PromptPilot's model provider.
-//
-// The supplied tests in test/circuitBreaker.test.js describe the exact behaviour.
-// Do not modify the tests. Make them all pass.
-//
-// Requirements proven by the tests:
-//   - Start in the CLOSED state. While CLOSED, count calls and failures.
-//   - OPEN when (failures / calls) >= failureThreshold AND calls >= minimumRequests.
-//   - While OPEN and within openMillis, SHORT-CIRCUIT: throw CircuitOpenError
-//     WITHOUT calling fn, and increment metrics.short_circuited_total.
-//   - After openMillis has elapsed (use the injected now()), allow ONE probe
-//     call (HALF_OPEN). A successful probe -> CLOSED and reset the counts.
-//     A failed probe -> OPEN again.
-//   - Increment metrics.breaker_open_total every time you move to OPEN.
-//   - Call options.onStateChange(state) on every state transition.
-//
-// Injected options (all optional, with sensible defaults):
-//   failureThreshold, minimumRequests, openMillis, now, onStateChange
+// Circuit breaker for PromptPilot's model provider.
+// Metrics are in-memory counters; onStateChange can be connected to structured logging.
 
 class CircuitOpenError extends Error {
   constructor() {
     super('circuit is open');
+    this.name = 'CircuitOpenError';
     this.code = 'CIRCUIT_OPEN';
   }
 }
 
 function createCircuitBreaker(options = {}) {
+  const failureThreshold = options.failureThreshold ?? 0.5;
+  const minimumRequests = options.minimumRequests ?? 5;
+  const openMillis = options.openMillis ?? 30_000;
   const now = options.now ?? Date.now;
   const onStateChange = options.onStateChange ?? function () {};
+
+  if (typeof failureThreshold !== 'number' || failureThreshold < 0 || failureThreshold > 1) {
+    throw new RangeError('failureThreshold must be between 0 and 1');
+  }
+  if (!Number.isInteger(minimumRequests) || minimumRequests < 1) {
+    throw new RangeError('minimumRequests must be a positive integer');
+  }
+  if (typeof openMillis !== 'number' || openMillis < 0) {
+    throw new RangeError('openMillis must be a non-negative number');
+  }
+  if (typeof now !== 'function' || typeof onStateChange !== 'function') {
+    throw new TypeError('now and onStateChange must be functions');
+  }
 
   const metrics = {
     breaker_open_total: 0,
@@ -38,12 +39,75 @@ function createCircuitBreaker(options = {}) {
   };
 
   let state = 'CLOSED';
+  let calls = 0;
+  let failures = 0;
+  let openedAt = null;
+  let probeInFlight = false;
+
+  function transition(nextState) {
+    if (state === nextState) return;
+    state = nextState;
+    if (nextState === 'OPEN') {
+      openedAt = now();
+      probeInFlight = false;
+      metrics.breaker_open_total += 1;
+    }
+    // Observability callbacks must not break the protected request path.
+    try {
+      onStateChange(nextState);
+    } catch (_) {
+      // A logging/metrics sink failure must not disable the breaker.
+    }
+  }
+
+  function shortCircuit() {
+    metrics.short_circuited_total += 1;
+    throw new CircuitOpenError();
+  }
 
   async function exec(fn) {
-    // TODO: Replace this pass-through with real circuit-breaker logic so that
-    // the supplied tests pass. Right now every call goes straight through and
-    // the breaker never opens.
-    return fn();
+    if (typeof fn !== 'function') {
+      throw new TypeError('exec expects a function');
+    }
+
+    let isProbe = false;
+    if (state === 'OPEN') {
+      if (now() - openedAt < openMillis) return shortCircuit();
+      transition('HALF_OPEN');
+      probeInFlight = true;
+      isProbe = true;
+    } else if (state === 'HALF_OPEN') {
+      // Only one request is allowed to test recovery at a time.
+      if (probeInFlight) return shortCircuit();
+      probeInFlight = true;
+      isProbe = true;
+    }
+
+    if (!isProbe) calls += 1;
+
+    try {
+      const result = await fn();
+      metrics.success_total += 1;
+      if (isProbe) {
+        probeInFlight = false;
+        transition('CLOSED');
+        calls = 0;
+        failures = 0;
+      }
+      return result;
+    } catch (error) {
+      metrics.failure_total += 1;
+      if (isProbe) {
+        probeInFlight = false;
+        transition('OPEN');
+      } else if (state === 'CLOSED') {
+        failures += 1;
+        if (calls >= minimumRequests && failures / calls >= failureThreshold) {
+          transition('OPEN');
+        }
+      }
+      throw error;
+    }
   }
 
   return {

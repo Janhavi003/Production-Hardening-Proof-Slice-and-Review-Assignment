@@ -1,57 +1,72 @@
-# Starter — Circuit Breaker Proof Slice (PromptPilot)
+# PromptPilot — Circuit Breaker Proof Slice
 
-This is the starter repository for **Option B (provided scenario)** of the assignment.
+This repository implements Option B of the Production Hardening Proof Slice and Review assignment: a circuit breaker around PromptPilot's external model provider.
 
-Repository: `https://github.com/kalviumcommunity/Production-Hardening-Proof-Slice-and-Review-Assignment` (public, owned by
-`kalviumcommunity`). Fork it, implement the breaker, and open a pull request back to your fork.
+## Risk addressed
 
-> The control here is a **circuit breaker**, covered earlier in this module. You are applying a
-> concept you have already learned, not a new one.
+When the model provider is slow or failing, repeated requests can pile up and amplify an outage. Repeated provider failures can also make the support-reply workflow unavailable.
 
-## Scenario
+## Chosen control
 
-PromptPilot drafts support replies by calling an external model provider. When the provider is slow
-or failing, every request still tries it, so doomed calls pile up and the failure spreads. You will
-add a **circuit breaker** so sustained failures short-circuit fast to a safe fallback, then recover
-through a probe.
+`src/circuitBreaker.js` implements a circuit breaker with `CLOSED`, `OPEN`, and `HALF_OPEN` states. It opens when the failure ratio reaches the configured threshold after the minimum request volume, rejects calls during the open window, and permits one recovery probe after that window. `src/replyService.js` uses a safe fallback when the provider fails or the circuit is open.
 
-## Your task
+Defaults: `failureThreshold: 0.5`, `minimumRequests: 5`, and `openMillis: 30000`. These can be overridden when calling `createCircuitBreaker` or `createReplyService`.
 
-Implement the circuit breaker in [`src/circuitBreaker.js`](./src/circuitBreaker.js). The file has a
-skeleton and a `TODO`. The behaviour is fully specified by the supplied tests.
+## How to run / test
 
-Prerequisite: Node.js 18 or newer (the tests use Node's built-in test runner). Then run:
+Prerequisite: Node.js 18 or newer. No third-party packages are required.
 
 ```bash
+cd Production-Hardening-Proof-Slice-and-Review-Assignment
+node --version
 node --test
 ```
 
-Make **all tests pass**. Do **not** modify the tests. The reply path in `src/replyService.js` is
-already wired to your breaker.
+Expected result: all tests pass, with a final summary showing zero failures.
 
-The breaker must:
+To run only the circuit-breaker tests:
 
-- start `CLOSED` and count calls and failures;
-- move to `OPEN` when `failures / calls >= failureThreshold` **and** `calls >= minimumRequests`;
-- while `OPEN` and within `openMillis`, short-circuit (throw `CircuitOpenError` without calling the
-  dependency) and increment `metrics.short_circuited_total`;
-- after `openMillis` elapses (using the injected `now()`), allow one `HALF_OPEN` probe — success
-  closes it and resets counts, failure re-opens it;
-- increment `metrics.breaker_open_total` on every trip and call `onStateChange(state)` on every
-  transition.
+```bash
+node --test test/circuitBreaker.test.js
+```
 
-## What to submit
+## Evidence
 
-Open a pull request on a branch named `production-hardening-slice`, and in your README include these
-labelled sections:
+The automated tests prove that the breaker:
+- stays closed below `minimumRequests`;
+- opens when the failure ratio reaches the threshold at sufficient volume;
+- rejects calls while open without invoking the provider;
+- transitions to `HALF_OPEN` after the open window and closes after a successful probe;
+- reopens after a failed probe; and
+- reports transitions through `onStateChange`.
 
-1. **Risk addressed**
-2. **Chosen control**
-3. **How to run / test**
-4. **Evidence** (a reviewer can confirm it works without reading all your code)
-5. **Observability note** (which metric moves and which state changes are logged)
-6. **Trade-off**
-7. **Remaining risk**
-8. **How this production control protects my Modules 1–3 design**
+The reply-service tests also prove that an open circuit returns the configured safe fallback. Reproduce the evidence with `node --test`.
 
-Submit the pull-request URL.
+## Observability note
+
+The breaker exposes `breaker_open_total`, `short_circuited_total`, `success_total`, and `failure_total`. The optional `onStateChange(state)` callback is invoked on each state transition (`OPEN`, `HALF_OPEN`, and `CLOSED`), so the host service can emit structured logs or connect the counters to its metrics backend. The callback is isolated so a logging failure cannot break the protected request path. Do not log secrets, tokens, full prompts, or personal data.
+
+## Trade-off
+
+The breaker adds state and a short-circuit fallback path. During recovery, one probe request is allowed while concurrent calls are rejected. Thresholds and the open duration require tuning to the provider's normal error rate and latency.
+
+## Remaining risk
+
+The counters are in-memory and reset when the process restarts; they are not a distributed breaker across multiple instances. A successful probe only confirms one request worked, and the fallback may not fully satisfy every ticket. A production deployment should export metrics to a durable monitoring system and consider per-provider/per-tenant isolation and a fallback-quality policy.
+
+## How this production control protects my Modules 1–3 design
+
+The breaker protects the support-reply workflow from an unhealthy optional model dependency, preserving the API's ability to return a safe response rather than waiting on repeated doomed provider calls. It complements the service's existing fallback contract; it does not replace request validation, authorization, or data-integrity guarantees.
+
+## Pull request submission
+
+Create the required branch, commit your implementation, push it to your fork, and open a pull request from `production-hardening-slice`.
+
+```bash
+git checkout -b production-hardening-slice
+git add src/circuitBreaker.js README.md
+git commit -m "Implement PromptPilot circuit breaker proof slice"
+git push -u origin production-hardening-slice
+```
+
+Then open your fork on GitHub and create a pull request. Include the passing output from `node --test` in the PR description. The commands above prepare and push the branch; they do not create the PR automatically.
